@@ -381,7 +381,7 @@ const API=`${SUPABASE_URL}/rest/v1`;
 const STORAGE=`${SUPABASE_URL}/storage/v1`;
 const HDR={'apikey':SUPABASE_KEY,'Authorization':`Bearer ${SUPABASE_KEY}`,'Content-Type':'application/json','Prefer':'return=representation'};
 
-let tools=[],categories=[],photos=[];
+let tools=[],categories=[];let photoCache={};
 let editingId=null,viewingId=null,pendingPhotos=[],activeCategory='',viewMode='grid';
 
 // PIN
@@ -413,7 +413,7 @@ async function uploadPhoto(file,toolId){
 async function init(){
   loadingStart();
   try{
-    await Promise.all([loadTools(),loadCategories(),loadPhotos()]);
+    await Promise.all([loadTools(),loadCategories()]);
     renderCatTabs();renderGrid();renderDashboard();updateStats();setSyncDot('ok');
   }catch(e){console.error(e);toast('Connection error');setSyncDot('error');renderCatTabs();renderGrid();}
   loadingDone();
@@ -427,8 +427,16 @@ async function loadCategories(){
     categories=defaults;
   }else{categories=rows.map(r=>r.name);}
 }
-async function loadPhotos(){photos=await sbGet('photos','order=position.asc');}
-function photosForTool(id){return photos.filter(p=>p.tool_id===id).sort((a,b)=>a.position-b.position);}
+async function loadPhotosForTool(id){
+  if(photoCache[id]!==undefined)return photoCache[id];
+  try{
+    const rows=await sbGet('photos',`tool_id=eq.${id}&order=position.asc`);
+    photoCache[id]=rows;
+    return rows;
+  }catch(e){photoCache[id]=[];return[];}
+}
+function invalidatePhotoCache(id){delete photoCache[id];}
+function photosForTool(id){return photoCache[id]||[];}
 
 // CALC
 function updateCalc(){
@@ -440,7 +448,7 @@ function updateCalc(){
 function totalValue(t){return(parseFloat(t.unit_value)||parseFloat(t.value)||0)*(parseInt(t.quantity)||1);}
 
 // RENDER
-function renderGrid(){
+async function renderGrid(){
   const q=document.getElementById('search-input').value.toLowerCase();
   const sort=document.getElementById('sort-sel').value;
   let items=tools.filter(t=>{
@@ -461,15 +469,15 @@ function renderGrid(){
   if(!items.length){grid.innerHTML=`<div class="empty-state"><div class="icon">🔧</div><p>${q||activeCategory?'No tools match.':'No tools yet — tap + to add your first.'}</p></div>`;return;}
   grid.innerHTML='';
   items.forEach(t=>{
-    const tp=photosForTool(t.id);
     const qty=parseInt(t.quantity)||1;
     const tv=totalValue(t);
     const uv=parseFloat(t.unit_value)||parseFloat(t.value)||0;
     const card=document.createElement('div');
     card.className='tool-card';card.onclick=()=>openDetail(t.id);
+    const tp=photoCache[t.id]||[];
     const photoHtml=tp.length
       ?`<div class="tc-photo"><img src="${tp[0].url}" alt="${t.name}" loading="lazy">${qty>1?`<div class="tc-qty-badge">×${qty}</div>`:''} ${tp.length>1?`<div class="photo-count">+${tp.length}</div>`:''}</div>`
-      :`<div class="tc-photo">${qty>1?`<div class="tc-qty-badge">×${qty}</div>`:''}🔧</div>`;
+      :`<div class="tc-photo"><div class="tc-photo-placeholder" data-id="${t.id}">${qty>1?`<div class="tc-qty-badge">×${qty}</div>`:''}🔧</div></div>`;
     card.innerHTML=`${photoHtml}
       <div class="tc-body">
         <div class="tc-cat">${t.cat||'Uncategorized'}</div>
@@ -482,6 +490,20 @@ function renderGrid(){
       </div>`;
     grid.appendChild(card);
   });
+  // Lazy load photos for visible cards
+  setTimeout(()=>{
+    document.querySelectorAll('.tc-photo-placeholder').forEach(async el=>{
+      const id=el.dataset.id;
+      if(!id)return;
+      const photos=await loadPhotosForTool(id);
+      if(photos.length>0){
+        const t=tools.find(x=>x.id===id);
+        const qty=parseInt(t?.quantity)||1;
+        const parent=el.parentElement;
+        parent.innerHTML=`<img src="${photos[0].url}" alt="" loading="lazy">${qty>1?`<div class="tc-qty-badge">×${qty}</div>`:''} ${photos.length>1?`<div class="photo-count">+${photos.length}</div>`:''}`;
+      }
+    });
+  },100);
 }
 function renderCatTabs(){
   const tabs=document.getElementById('cat-tabs');tabs.innerHTML='';
@@ -494,7 +516,7 @@ function renderDashboard(){
   const totalVal=tools.reduce((s,t)=>s+totalValue(t),0);
   const totalItems=tools.reduce((s,t)=>s+(parseInt(t.quantity)||1),0);
   const totalPaid=tools.reduce((s,t)=>s+(parseFloat(t.price)||0)*(parseInt(t.quantity)||1),0);
-  const withPhotos=tools.filter(t=>photosForTool(t.id).length>0).length;
+  const withPhotos=tools.filter(t=>(photoCache[t.id]||[]).length>0).length;
   const cats=[...new Set(tools.map(t=>t.cat).filter(Boolean))].length;
   document.getElementById('dashboard').innerHTML=`
     <div class="dash-card"><div class="dc-label">SKUs</div><div class="dc-val">${tools.length}</div><div class="dc-sub">${totalItems} total items</div></div>
@@ -524,10 +546,10 @@ function openAdd(){
   document.getElementById('modal-overlay').classList.add('open');
   setTimeout(()=>document.getElementById('f-name').focus(),100);
 }
-function openEdit(id){
+async function openEdit(id){
   const t=tools.find(x=>x.id===id);if(!t)return;
   editingId=id;
-  const tp=photosForTool(id);
+  const tp=await loadPhotosForTool(id);
   pendingPhotos=tp.map(p=>({existing:true,url:p.url,dbId:p.id}));
   document.getElementById('modal-title').textContent='Edit Tool';
   document.getElementById('delete-btn').style.display='block';
@@ -600,7 +622,7 @@ async function saveTool(){
       if(!url)url=p.dataUrl;
       await sbPost('photos',{id:`ph_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,tool_id:toolId,url,position:pos++});
     }
-    await Promise.all([loadTools(),loadPhotos()]);
+    invalidatePhotoCache(toolId);await loadPhotosForTool(toolId);await loadTools();
     renderGrid();renderDashboard();renderCatTabs();updateStats();
     closeModal();toast(editingId?'Tool updated':'Tool added');setSyncDot('ok');
   }catch(e){console.error(e);toast('Save failed — '+e.message.slice(0,60));setSyncDot('error');}
@@ -615,7 +637,7 @@ function deleteCurrent(){
   const t=tools.find(x=>x.id===editingId);if(!t)return;
   openConfirm(`Delete "${t.name}"? This cannot be undone.`,async()=>{
     setSyncDot('syncing');
-    try{await sbDeleteWhere('photos','tool_id',editingId);await sbDelete('tools',editingId);await Promise.all([loadTools(),loadPhotos()]);renderGrid();renderDashboard();renderCatTabs();updateStats();closeModal();toast('Tool deleted');setSyncDot('ok');}
+    try{await sbDeleteWhere('photos','tool_id',editingId);await sbDelete('tools',editingId);invalidatePhotoCache(editingId);await loadTools();renderGrid();renderDashboard();renderCatTabs();updateStats();closeModal();toast('Tool deleted');setSyncDot('ok');}
     catch(e){toast('Delete failed');setSyncDot('error');}
   });
 }
@@ -623,16 +645,16 @@ function deleteFromDetail(){
   const t=tools.find(x=>x.id===viewingId);if(!t)return;
   openConfirm(`Delete "${t.name}"?`,async()=>{
     setSyncDot('syncing');
-    try{await sbDeleteWhere('photos','tool_id',viewingId);await sbDelete('tools',viewingId);await Promise.all([loadTools(),loadPhotos()]);renderGrid();renderDashboard();renderCatTabs();updateStats();closeDetail();toast('Tool deleted');setSyncDot('ok');}
+    try{await sbDeleteWhere('photos','tool_id',viewingId);await sbDelete('tools',viewingId);invalidatePhotoCache(viewingId);await loadTools();renderGrid();renderDashboard();renderCatTabs();updateStats();closeDetail();toast('Tool deleted');setSyncDot('ok');}
     catch(e){toast('Delete failed');setSyncDot('error');}
   });
 }
 
 // DETAIL
-function openDetail(id){
+async function openDetail(id){
   const t=tools.find(x=>x.id===id);if(!t)return;
   viewingId=id;
-  const tp=photosForTool(id);
+  const tp=await loadPhotosForTool(id);
   const qty=parseInt(t.quantity)||1;
   const uv=parseFloat(t.unit_value)||parseFloat(t.value)||0;
   const tv=totalValue(t);
@@ -682,7 +704,7 @@ async function removeCategory(c){
 // SYNC
 async function syncNow(){
   setSyncDot('syncing');
-  try{await Promise.all([loadTools(),loadPhotos(),loadCategories()]);renderGrid();renderDashboard();renderCatTabs();updateStats();setSyncDot('ok');toast('Synced');}
+  try{photoCache={};await Promise.all([loadTools(),loadCategories()]);renderGrid();renderDashboard();renderCatTabs();updateStats();setSyncDot('ok');toast('Synced');}
   catch(e){setSyncDot('error');toast('Sync failed');}
 }
 function setSyncDot(s){const d=document.getElementById('sync-dot');d.className='sync-dot'+(s==='syncing'?' syncing':s==='error'?' error':'');}
@@ -711,7 +733,7 @@ async function exportPDF(){
   y+=24;doc.setTextColor(0);
   let currentCat='';
   for(const t of items){
-    const tp=photosForTool(t.id);
+    const tp=await loadPhotosForTool(t.id);
     const qty=parseInt(t.quantity)||1;
     const uv=parseFloat(t.unit_value)||parseFloat(t.value)||0;
     const tv=totalValue(t);
